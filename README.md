@@ -12,8 +12,8 @@
 1. **Клонування Репозиторію:**
 
    ```shell
-   git clone https://github.com/your-username/telegram-entertainment-bot.git
-   cd telegram-entertainment-bot
+   git clone https://github.com/CatEllite312/trigger-telegram-bot
+   cd trigger-telegram-bot
    ```
 
 2. **Налаштування Конфігурації:**
