@@ -48,6 +48,14 @@
 - macOS
 - Windows
 
+## Залежності
+
+Для роботи цього проекту потрібно встановити бібліотеку `github.com/go-telegram-bot-api/telegram-bot-api`. Щоб встановити її, використовуйте команду:
+
+```shell
+go get github.com/go-telegram-bot-api/telegram-bot-api
+```
+
 ## Ліцензія
 
-Цей проект розповсюджується за ліцензією MIT
+Цей проект розповсюджується за ліцензією MIT.
