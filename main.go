@@ -9,10 +9,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dgraph-io/badger/v3"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api"
 )
 
 var triggers []string
+var db *badger.DB
 
 func main() {
 	botToken, err := loadToken()
@@ -33,9 +35,21 @@ func main() {
 		log.Fatalf("Помилка при отриманні оновлень: %v\n", err)
 	}
 
+	// Ініціалізуємо BadgerDB з налаштуваннями розміру vlog
+	db, err = badger.Open(badger.DefaultOptions("badger").
+		WithValueLogFileSize(1024 * 1024 * 10). // Розмір vlog, замініть на потрібний
+		WithNumVersionsToKeep(0).
+		WithCompactL0OnClose(true).
+		WithNumLevelZeroTables(1).
+		WithNumLevelZeroTablesStall(2))
+	if err != nil {
+		log.Fatalf("Помилка при відкритті BadgerDB: %v\n", err)
+	}
+	defer db.Close()
+
 	log.Println("Бот запущений та готовий до прийому команд...")
 
-	// Перед початком виконання команд /save та /del оновлюємо список триггерів з файлу
+	// Перед початком виконання команд /save та /del оновлюємо список тригерів з бази даних
 	updateTriggerList()
 
 	for update := range updates {
@@ -131,7 +145,7 @@ func handleHelpCommand(bot *tgbotapi.BotAPI, message *tgbotapi.Message) {
 /start - почати використовувати бота
 /save <тригер> - зберегти тригер
 /del <тригер> - видалити тригер
-/list - вивести список тригерів
+/list - вивести список триггерів
 /ping - перевірити доступність бота та його швидкість відповіді
 /help - отримати цю довідку`
 
@@ -177,16 +191,15 @@ func extractMediaID(message *tgbotapi.Message) (string, string) {
 }
 
 func saveTrigger(trigger, messageText, mediaType, mediaID string) {
-	file, err := os.OpenFile("triggers.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		log.Printf("Помилка при відкритті файлу: %v\n", err)
-		return
-	}
-	defer file.Close()
+	err := db.Update(func(txn *badger.Txn) error {
+		key := []byte(trigger)
+		value := []byte(fmt.Sprintf("%s|%s|%s|%s", trigger, messageText, mediaType, mediaID))
+		err := txn.Set(key, value)
+		return err
+	})
 
-	data := fmt.Sprintf("%s|%s|%s|%s\n", trigger, messageText, mediaType, mediaID)
-	if _, err := file.WriteString(data); err != nil {
-		log.Printf("Помилка при запису в файл: %v\n", err)
+	if err != nil {
+		log.Printf("Помилка при збереженні тригера в BadgerDB: %v\n", err)
 	}
 
 	log.Printf("Тригер збережено: %s\n", trigger)
@@ -194,98 +207,66 @@ func saveTrigger(trigger, messageText, mediaType, mediaID string) {
 }
 
 func deleteTrigger(trigger string) {
-	inputFile, err := os.Open("triggers.txt")
+	err := db.Update(func(txn *badger.Txn) error {
+		key := []byte(trigger)
+		err := txn.Delete(key)
+		return err
+	})
+
 	if err != nil {
-		log.Printf("Помилка при відкритті файлу: %v\n", err)
-		return
-	}
-	defer inputFile.Close()
-
-	lines := make([]string, 0)
-	scanner := bufio.NewScanner(inputFile)
-	for scanner.Scan() {
-		line := scanner.Text()
-		parts := strings.SplitN(line, "|", 4)
-		if len(parts) < 4 {
-			continue
-		}
-		if parts[0] != trigger {
-			lines = append(lines, line)
-		}
+		log.Printf("Помилка при видаленні тригера з BadgerDB: %v\n", err)
 	}
 
-	if err := scanner.Err(); err != nil {
-		log.Printf("Помилка при читанні файлу: %v\n", err)
-		return
-	}
-
-	outputFile, err := os.Create("triggers.txt")
-	if err != nil {
-		log.Printf("Помилка при створенні файлу: %v\n", err)
-		return
-	}
-	defer outputFile.Close()
-
-	for _, line := range lines {
-		_, err := outputFile.WriteString(line + "\n")
-		if err != nil {
-			log.Printf("Помилка при запису в файл: %v\n", err)
-		}
-	}
 	log.Printf("Тригер видалено: %s\n", trigger)
 	updateTriggerList()
 }
 
 func sendTriggeredMessage(bot *tgbotapi.BotAPI, chatID int64, text, triggerUser string) {
-	file, err := os.Open("triggers.txt")
-	if err != nil {
-		log.Printf("Помилка при відкритті файлу: %v\n", err)
-		return
-	}
-	defer file.Close()
+	err := db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchSize = 10
+		it := txn.NewIterator(opts)
+		defer it.Close()
 
-	var bestMatchTrigger string
-	var bestMatchMediaID string
-	var bestMatchMediaType string
-	var bestMatchMessageText string
+		var bestMatchTrigger string
+		var bestMatchMediaID string
+		var bestMatchMediaType string
+		var bestMatchMessageText string
 
-	var matchingTriggers []string // Список підходящих триггерів
+		for it.Rewind(); it.Valid(); it.Next() {
+			item := it.Item()
+			key := item.Key()
+			trigger := string(key)
 
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		parts := strings.SplitN(scanner.Text(), "|", 4)
-		if len(parts) < 4 {
-			continue
-		}
-		trigger, messageText, mediaType, mediaID := parts[0], parts[1], parts[2], parts[3]
-
-		// Перевіряємо, чи містить текст повідомлення цей триггер
-		if strings.Contains(text, trigger) {
-			matchingTriggers = append(matchingTriggers, trigger)
-
-			// Якщо знайшли найкращий триггер, оновлюємо значення
-			if len(trigger) > len(bestMatchTrigger) {
-				bestMatchTrigger = trigger
-				bestMatchMediaID = mediaID
-				bestMatchMediaType = mediaType
-				bestMatchMessageText = messageText
+			if strings.Contains(text, trigger) {
+				// Знайдено співпадіння з тригером
+				if len(trigger) > len(bestMatchTrigger) {
+					bestMatchTrigger = trigger
+					value, err := item.ValueCopy(nil)
+					if err != nil {
+						log.Printf("Помилка при копіюванні значення тригера: %v\n", err)
+						continue
+					}
+					parts := strings.SplitN(string(value), "|", 4)
+					if len(parts) >= 4 {
+						bestMatchMessageText = parts[1]
+						bestMatchMediaType = parts[2]
+						bestMatchMediaID = parts[3]
+					}
+				}
 			}
 		}
-	}
 
-	if len(matchingTriggers) > 0 {
-		// Якщо є підходящі триггери, вибираємо найкращий
-		// (можна додатково внести логіку, якщо є декілька підходящих)
-		bestMatchTrigger = matchingTriggers[0]
-	}
+		if bestMatchTrigger != "" {
+			// Якщо знайшли найкращий тригер, надсилаємо відповідне медіа
+			sendMedia(bot, chatID, bestMatchMediaType, bestMatchMediaID, bestMatchMessageText, triggerUser)
+		}
 
-	if bestMatchTrigger != "" {
-		// Якщо знайшли найкращий триггер, надсилаємо відповідне медіа
-		sendMedia(bot, chatID, bestMatchMediaType, bestMatchMediaID, bestMatchMessageText, triggerUser)
-	}
+		return nil
+	})
 
-	if err := scanner.Err(); err != nil {
-		log.Printf("Помилка при читанні файлу: %v\n", err)
+	if err != nil {
+		log.Printf("Помилка при пошуку тригерів в базі даних: %v\n", err)
 	}
 }
 
@@ -348,25 +329,24 @@ func sendMessage(bot *tgbotapi.BotAPI, chatID int64, text string) {
 }
 
 func updateTriggerList() {
-	fileData, err := os.ReadFile("triggers.txt")
+	err := db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchSize = 10
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		triggers = []string{}
+		for it.Rewind(); it.Valid(); it.Next() {
+			item := it.Item()
+			key := item.Key()
+			trigger := string(key)
+			triggers = append(triggers, trigger)
+		}
+		return nil
+	})
+
 	if err != nil {
-		log.Printf("Помилка при читанні файлу: %v\n", err)
-		return
-	}
-
-	triggerLines := strings.Split(string(fileData), "\n")
-	triggers = make([]string, 0, len(triggerLines))
-
-	for _, line := range triggerLines {
-		// Ігноруємо порожні рядки
-		if line == "" {
-			continue
-		}
-
-		parts := strings.SplitN(line, "|", 4)
-		if len(parts) >= 1 {
-			triggers = append(triggers, parts[0])
-		}
+		log.Printf("Помилка при оновленні списку триггерів: %v\n", err)
 	}
 }
 
